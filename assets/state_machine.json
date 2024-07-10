@@ -14,7 +14,7 @@
         "OutputBucketName": "{{AUDIO_BUCKET}}",
         "OutputKey.$": "States.Format('transcription_output/{}.json', $.filename)"
       },
-      "Next": "GetTranscriptionResult",
+      "Next": "WaitForTranscriptionResult",
       "ResultPath": "$.transcription_result",
       "Catch": [
         {
@@ -23,6 +23,11 @@
           "Next": "TranscribeFailed"
         }
       ]
+    },
+    "WaitForTranscriptionResult": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "GetTranscriptionResult"
     },
     "GetTranscriptionResult": {
       "Type": "Task",
@@ -47,38 +52,23 @@
         "parsed_body.$": "States.StringToJson($.transcription_text.Body)",
         "filename.$": "$.filename"
       },
-      "Next": "ExtractText"
+      "Next": "ExtractTextAndLanguage"
     },
-    "ExtractText": {
+    "ExtractTextAndLanguage": {
       "Type": "Pass",
       "Parameters": {
         "transcription.$": "$.parsed_body.results.transcripts[0].transcript",
+        "language_code": "es-US",
         "filename.$": "$.filename"
       },
-      "Next": "DetectLanguage"
-    },
-    "DetectLanguage": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:comprehend:detectDominantLanguage",
-      "Parameters": {
-        "Text.$": "$.transcription"
-      },
-      "ResultPath": "$.language_detection_result",
-      "Next": "IsEnglish",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "LanguageDetectionFailed"
-        }
-      ]
+      "Next": "IsEnglish"
     },
     "IsEnglish": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.language_detection_result.Languages[0].LanguageCode",
-          "StringEquals": "en",
+          "Variable": "$.language_code",
+          "StringEquals": "en-US",
           "Next": "EndState"
         }
       ],
@@ -89,7 +79,7 @@
       "Resource": "arn:aws:states:::aws-sdk:translate:translateText",
       "Parameters": {
         "Text.$": "$.transcription",
-        "SourceLanguageCode.$": "$.language_detection_result.Languages[0].LanguageCode",
+        "SourceLanguageCode.$": "$.language_code",
         "TargetLanguageCode": "en"
       },
       "ResultPath": "$.translation_result",
@@ -161,11 +151,6 @@
     },
     "EndState": {
       "Type": "Succeed"
-    },
-    "LanguageDetectionFailed": {
-      "Type": "Fail",
-      "Error": "LanguageDetectionError",
-      "Cause": "Language detection failed"
     },
     "TranscribeFailed": {
       "Type": "Fail",
