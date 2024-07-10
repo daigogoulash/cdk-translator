@@ -1,9 +1,9 @@
+import json
 from aws_cdk import (
     Stack,
     aws_s3 as s3,
     aws_iam as iam,
-    aws_stepfunctions as sfn,
-    aws_stepfunctions_tasks as tasks,
+    aws_stepfunctions as sf,
     aws_events as events,
     aws_events_targets as targets,
 )
@@ -17,87 +17,53 @@ class TranslatorStack(Stack):
         # S3 bucket for audio files
         audio_bucket = s3.Bucket(self, "AudioBucket")
 
+        # S3 bucket for transcription outputs
+        transcription_output_bucket = s3.Bucket(self, "TranscriptionOutputBucket")
+
         # IAM role for Step Functions
-        state_machine_role = iam.Role(self, "StateMachineRole",
-                                      assumed_by=iam.ServicePrincipal("states.amazonaws.com"),
-                                      managed_policies=[
-                                          iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole"),
-                                          iam.ManagedPolicy.from_aws_managed_policy_name("AmazonS3FullAccess"),
-                                          iam.ManagedPolicy.from_aws_managed_policy_name("AmazonTranscribeFullAccess"),
-                                          iam.ManagedPolicy.from_aws_managed_policy_name("ComprehendReadOnly"),
-                                          iam.ManagedPolicy.from_aws_managed_policy_name("TranslateReadOnly"),
-                                          iam.ManagedPolicy.from_aws_managed_policy_name("AmazonPollyFullAccess")
-                                      ])
+        role = iam.Role(self, "StateMachineRole",
+                        assumed_by=iam.ServicePrincipal("states.amazonaws.com"))
 
-        # Step Function definition
-        transcribe_task = tasks.CallAwsService(self, "TranscribeAudio",
-                                               service="transcribe",
-                                               action="startTranscriptionJob",
-                                               parameters={
-                                                   "TranscriptionJobName": sfn.JsonPath.string_at("$.filename"),
-                                                   "LanguageCode": "auto",
-                                                   "Media": {
-                                                       "MediaFileUri": sfn.JsonPath.string_at("$.s3_input_audio_file")
-                                                   },
-                                                   "OutputBucketName": audio_bucket.bucket_name,
-                                                   "OutputKey": "transcription_output/"
-                                               },
-                                               iam_resources=["*"],
-                                               result_path="$.transcription_result")
+        role.add_to_policy(iam.PolicyStatement(
+            resources=["*"],
+            actions=[
+                "s3:*",
+                "transcribe:*",
+                "translate:*",
+                "polly:*",
+            ]
+        ))
 
-        detect_language_task = tasks.CallAwsService(self, "DetectLanguage",
-                                                    service="comprehend",
-                                                    action="detectDominantLanguage",
-                                                    parameters={
-                                                        "Text": sfn.JsonPath.string_at("$.transcription_text.Body.results.transcripts[0].transcript")
-                                                    },
-                                                    iam_resources=["*"],
-                                                    result_path="$.language_detection_result")
+        # Load the state machine definition JSON and replace placeholders with actual bucket names
+        with open('assets/state_machine.json', 'r') as f:
+            state_machine_definition = json.load(f)
 
-        translate_text_task = tasks.CallAwsService(self, "TranslateText",
-                                                   service="translate",
-                                                   action="translateText",
-                                                   parameters={
-                                                       "Text": sfn.JsonPath.string_at("$.transcription"),
-                                                       "SourceLanguageCode": sfn.JsonPath.string_at("$.language_detection_result.Languages[0].LanguageCode"),
-                                                       "TargetLanguageCode": "en"
-                                                   },
-                                                   iam_resources=["*"],
-                                                   result_path="$.translation_result")
+        # Replace placeholders
+        state_machine_definition_str = json.dumps(state_machine_definition)
+        state_machine_definition_str = state_machine_definition_str.replace('your-audio-upload-bucket', audio_bucket.bucket_name)
+        state_machine_definition_str = state_machine_definition_str.replace('your-transcription-output-bucket', transcription_output_bucket.bucket_name)
+        state_machine_definition = json.loads(state_machine_definition_str)
 
-        synthesize_speech_task = tasks.CallAwsService(self, "GenerateAudio",
-                                                      service="polly",
-                                                      action="startSpeechSynthesisTask",
-                                                      parameters={
-                                                          "Text": sfn.JsonPath.string_at("$.translation_result.TranslatedText"),
-                                                          "OutputFormat": "mp3",
-                                                          "VoiceId": "Joanna",
-                                                          "OutputS3BucketName": audio_bucket.bucket_name,
-                                                      },
-                                                      iam_resources=["*"],
-                                                      result_path="$.polly_result")
+        # Create the state machine definition
+        state_machine_definition_body = sf.DefinitionBody.from_string(json.dumps(state_machine_definition))
 
-        definition = transcribe_task.next(detect_language_task).next(translate_text_task).next(synthesize_speech_task)
+        # State machine definition from the modified JSON
+        state_machine = sf.StateMachine(
+            self, "StateMachine",
+            state_machine_name="AudioTranslation",
+            definition_body=state_machine_definition_body,
+            role=role
+        )
 
-        state_machine = sfn.StateMachine(self, "StateMachine",
-                                         definition=definition,
-                                         role=state_machine_role)
+        # Event rule to trigger the state machine on S3 object creation
+        rule = events.Rule(self, "Rule",
+                           event_pattern=events.EventPattern(
+                               source=["aws.s3"],
+                               detail_type=["Object Created"],
+                               resources=[audio_bucket.bucket_arn],
+                               detail={
+                                   "eventName": ["PutObject"]
+                               }
+                           ))
 
-        # EventBridge rule to trigger Step Function on audio file upload
-        event_rule = events.Rule(self, "AudioUploadRule",
-                                 event_pattern={
-                                     "source": ["aws.s3"],
-                                     "detail": {
-                                         "bucket": {
-                                             "name": [audio_bucket.bucket_name]
-                                         },
-                                         "object": {
-                                             "key": [{
-                                                 "prefix": ""
-                                             }]
-                                         }
-                                     },
-                                     "detail_type": ["Object Created"]
-                                 },
-                                 targets=[targets.SfnStateMachine(state_machine)])
-
+        rule.add_target(targets.SfnStateMachine(state_machine))
