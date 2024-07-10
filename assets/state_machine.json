@@ -1,151 +1,191 @@
 {
-  "Comment": "State machine to process audio file upload events, detect language, transcribe audio, translate if necessary, and generate audio using AWS Polly",
-  "StartAt": "ExtractS3EventDetails",
+  "StartAt": "TranscribeAudio",
   "States": {
-    "ExtractS3EventDetails": {
-      "Type": "Pass",
-      "ResultPath": "$.detail",
-      "Parameters": {
-        "bucket": "$.Records[0].s3.bucket.name",
-        "objectKey": "$.Records[0].s3.object.key",
-        "eventTime": "$.Records[0].eventTime"
-      },
-      "Next": "CheckFileType"
-    },
-    "CheckFileType": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.detail.objectKey",
-          "StringMatches": "*.mp3",
-          "Next": "StartTranscription"
-        },
-        {
-          "Variable": "$.detail.objectKey",
-          "StringMatches": "*.wav",
-          "Next": "StartTranscription"
-        },
-        {
-          "Variable": "$.detail.objectKey",
-          "StringMatches": "*.m4a",
-          "Next": "StartTranscription"
-        }
-      ],
-      "Default": "UnsupportedFileType"
-    },
-    "StartTranscription": {
+    "TranscribeAudio": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::transcribe:startTranscriptionJob.sync",
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
       "Parameters": {
-        "TranscriptionJobName.$": "States.Format('transcription-{}', $.detail.objectKey)",
-        "MediaFormat.$": "States.StringToJson(States.JsonMerge('{}', {'mp3': 'mp3', 'wav': 'wav', 'm4a': 'm4a'})[$.detail.objectKey.split('.')[-1]])",
+        "TranscriptionJobName.$": "States.Format('TranscriptionJob-{}-{}', $.filename, $.timestamp)",
+        "LanguageCode": "es-US",
+        "MediaFormat": "mp3",
         "Media": {
-          "MediaFileUri.$": "States.Format('s3://{}/{}', $.detail.bucket, $.detail.objectKey)"
+          "MediaFileUri.$": "States.Format('s3://{{AUDIO_BUCKET}}/{}', $.filename)"
         },
-        "IdentifyLanguage": true,
-        "OutputBucketName": "your-transcription-output-bucket"
+        "OutputBucketName": "{{AUDIO_BUCKET}}",
+        "OutputKey.$": "States.Format('transcription_output/{}.json', $.filename)"
       },
-      "Next": "CheckTranscriptionStatus"
+      "Next": "GetTranscriptionResult",
+      "ResultPath": "$.transcription_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "TranscribeFailed"
+        }
+      ]
     },
-    "CheckTranscriptionStatus": {
+    "GetTranscriptionResult": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::transcribe:getTranscriptionJob",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
       "Parameters": {
-        "TranscriptionJobName.$": "States.Format('transcription-{}', $.detail.objectKey)"
+        "Bucket": "{{AUDIO_BUCKET}}",
+        "Key.$": "States.Format('transcription_output/{}.json', $.filename)"
       },
-      "Next": "IsTranscriptionComplete"
+      "Next": "ParseTranscription",
+      "ResultPath": "$.transcription_text",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "GetTranscriptionFailed"
+        }
+      ]
     },
-    "IsTranscriptionComplete": {
+    "ParseTranscription": {
+      "Type": "Pass",
+      "Parameters": {
+        "parsed_body.$": "States.StringToJson($.transcription_text.Body)",
+        "filename.$": "$.filename"
+      },
+      "Next": "ExtractText"
+    },
+    "ExtractText": {
+      "Type": "Pass",
+      "Parameters": {
+        "transcription.$": "$.parsed_body.results.transcripts[0].transcript",
+        "filename.$": "$.filename"
+      },
+      "Next": "DetectLanguage"
+    },
+    "DetectLanguage": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:comprehend:detectDominantLanguage",
+      "Parameters": {
+        "Text.$": "$.transcription"
+      },
+      "ResultPath": "$.language_detection_result",
+      "Next": "IsEnglish",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "LanguageDetectionFailed"
+        }
+      ]
+    },
+    "IsEnglish": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.TranscriptionJob.TranscriptionJobStatus",
-          "StringEquals": "COMPLETED",
-          "Next": "CheckLanguage"
-        },
-        {
-          "Variable": "$.TranscriptionJob.TranscriptionJobStatus",
-          "StringEquals": "FAILED",
-          "Next": "TranscriptionFailed"
+          "Variable": "$.language_detection_result.Languages[0].LanguageCode",
+          "StringEquals": "en",
+          "Next": "EndState"
         }
       ],
-      "Default": "WaitBeforeCheckingTranscriptionStatus"
+      "Default": "TranslateText"
     },
-    "WaitBeforeCheckingTranscriptionStatus": {
-      "Type": "Wait",
-      "Seconds": 15,
-      "Next": "CheckTranscriptionStatus"
-    },
-    "CheckLanguage": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.TranscriptionJob.LanguageCode",
-          "StringEquals": "en-US",
-          "Next": "TranscriptionCompleted"
-        }
-      ],
-      "Default": "TranslateToEnglish"
-    },
-    "TranslateToEnglish": {
+    "TranslateText": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::translate:translateText",
+      "Resource": "arn:aws:states:::aws-sdk:translate:translateText",
       "Parameters": {
-        "Text.$": "$.TranscriptionJob.Transcript.TranscriptFileUri",
-        "SourceLanguageCode.$": "$.TranscriptionJob.LanguageCode",
+        "Text.$": "$.transcription",
+        "SourceLanguageCode.$": "$.language_detection_result.Languages[0].LanguageCode",
         "TargetLanguageCode": "en"
       },
-      "Next": "GenerateAudioWithPolly"
+      "ResultPath": "$.translation_result",
+      "Next": "GenerateAudio",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "TranslateFailed"
+        }
+      ]
     },
-    "GenerateAudioWithPolly": {
+    "GenerateAudio": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::polly:synthesizeSpeech.sync",
+      "Resource": "arn:aws:states:::aws-sdk:polly:startSpeechSynthesisTask",
       "Parameters": {
-        "Text.$": "$.TranslatedText",
+        "Text.$": "$.translation_result.TranslatedText",
         "OutputFormat": "mp3",
-        "VoiceId": "Joanna"
+        "VoiceId": "Joanna",
+        "OutputS3BucketName": "{{AUDIO_BUCKET}}",
+        "OutputS3KeyPrefix.$": "States.Format('translations/{}', $.filename)"
       },
-      "Next": "StorePollyOutput"
+      "Next": "CheckPollyTask",
+      "ResultPath": "$.polly_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PollyFailed"
+        }
+      ]
     },
-    "StorePollyOutput": {
+    "CheckPollyTask": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::s3:putObject",
+      "Resource": "arn:aws:states:::aws-sdk:polly:getSpeechSynthesisTask",
       "Parameters": {
-        "Bucket": "your-audio-upload-bucket",
-        "Key.$": "States.Format('translations/{}.mp3', $.detail.objectKey.split('/')[-1].split('.')[0])",
-        "Body.$": "$.AudioStream"
+        "TaskId.$": "$.polly_result.SynthesisTask.TaskId"
       },
-      "Next": "TranslationCompleted"
+      "Next": "CheckPollyTaskStatus",
+      "ResultPath": "$.polly_task_status",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PollyFailed"
+        }
+      ]
     },
-    "TranscriptionCompleted": {
-      "Type": "Pass",
-      "ResultPath": "$.TranscriptionResult",
-      "Parameters": {
-        "TranscriptionJobName.$": "$.TranscriptionJob.TranscriptionJobName",
-        "TranscriptionJobStatus.$": "$.TranscriptionJob.TranscriptionJobStatus",
-        "LanguageCode.$": "$.TranscriptionJob.LanguageCode",
-        "TranscriptFileUri.$": "$.TranscriptionJob.Transcript.TranscriptFileUri"
-      },
-      "End": true
+    "CheckPollyTaskStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.polly_task_status.SynthesisTask.TaskStatus",
+          "StringEquals": "completed",
+          "Next": "EndState"
+        },
+        {
+          "Variable": "$.polly_task_status.SynthesisTask.TaskStatus",
+          "StringEquals": "failed",
+          "Next": "PollyFailed"
+        }
+      ],
+      "Default": "WaitState"
     },
-    "TranslationCompleted": {
-      "Type": "Pass",
-      "ResultPath": "$.TranslationResult",
-      "Parameters": {
-        "TranslatedText.$": "$.TranslatedText",
-        "AudioFileUri.$": "States.Format('s3://your-audio-upload-bucket/translations/{}.mp3', $.detail.bucket, $.detail.objectKey.split('/')[-1].split('.')[0])"
-      },
-      "End": true
+    "WaitState": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "CheckPollyTask"
     },
-    "TranscriptionFailed": {
+    "EndState": {
+      "Type": "Succeed"
+    },
+    "LanguageDetectionFailed": {
       "Type": "Fail",
-      "Error": "TranscriptionFailed",
-      "Cause": "The transcription job failed."
+      "Error": "LanguageDetectionError",
+      "Cause": "Language detection failed"
     },
-    "UnsupportedFileType": {
+    "TranscribeFailed": {
       "Type": "Fail",
-      "Error": "UnsupportedFileType",
-      "Cause": "The uploaded file type is not supported."
+      "Error": "TranscriptionError",
+      "Cause": "Transcription failed"
+    },
+    "GetTranscriptionFailed": {
+      "Type": "Fail",
+      "Error": "GetTranscriptionError",
+      "Cause": "Getting transcription result failed"
+    },
+    "TranslateFailed": {
+      "Type": "Fail",
+      "Error": "TranslationError",
+      "Cause": "Translation failed"
+    },
+    "PollyFailed": {
+      "Type": "Fail",
+      "Error": "PollyError",
+      "Cause": "Polly synthesis failed"
     }
   }
 }

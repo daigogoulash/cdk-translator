@@ -17,9 +17,6 @@ class TranslatorStack(Stack):
         # S3 bucket for audio files
         audio_bucket = s3.Bucket(self, "AudioBucket")
 
-        # S3 bucket for transcription outputs
-        transcription_output_bucket = s3.Bucket(self, "TranscriptionOutputBucket")
-
         # IAM role for Step Functions
         role = iam.Role(self, "StateMachineRole",
                         assumed_by=iam.ServicePrincipal("states.amazonaws.com"))
@@ -31,6 +28,7 @@ class TranslatorStack(Stack):
                 "transcribe:*",
                 "translate:*",
                 "polly:*",
+                "comprehend:*",
             ]
         ))
 
@@ -40,8 +38,7 @@ class TranslatorStack(Stack):
 
         # Replace placeholders
         state_machine_definition_str = json.dumps(state_machine_definition)
-        state_machine_definition_str = state_machine_definition_str.replace('your-audio-upload-bucket', audio_bucket.bucket_name)
-        state_machine_definition_str = state_machine_definition_str.replace('your-transcription-output-bucket', transcription_output_bucket.bucket_name)
+        state_machine_definition_str = state_machine_definition_str.replace('{{AUDIO_BUCKET}}', audio_bucket.bucket_name)
         state_machine_definition = json.loads(state_machine_definition_str)
 
         # Create the state machine definition
@@ -62,7 +59,7 @@ class TranslatorStack(Stack):
                                detail_type=["Object Created"],
                                resources=[audio_bucket.bucket_arn],
                                detail={
-                                   "eventName": ["PutObject"]
+                                   "eventName": ["PutObject", "CompleteMultipartUpload"]
                                }
                            ))
 
