@@ -5,14 +5,14 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
       "Parameters": {
-        "TranscriptionJobName.$": "States.Format('TranscriptionJob-{}-{}', $.filename, $.timestamp)",
+        "TranscriptionJobName.$": "States.Format('TranscriptionJob-{}', $.detail.requestParameters.key)",
         "LanguageCode": "es-US",
         "MediaFormat": "mp3",
         "Media": {
-          "MediaFileUri.$": "States.Format('s3://{{AUDIO_BUCKET}}/{}', $.filename)"
+          "MediaFileUri.$": "States.Format('s3://{}/{}', $.detail.requestParameters.bucketName, $.detail.requestParameters.key)"
         },
-        "OutputBucketName": "{{AUDIO_BUCKET}}",
-        "OutputKey.$": "States.Format('transcription_output/{}.json', $.filename)"
+        "OutputBucketName": "translatorstack-audiobucket96beecba-j7bnanhdwcyu",
+        "OutputKey.$": "States.Format('transcription_output/{}.json', $.detail.requestParameters.key)"
       },
       "Next": "WaitForTranscriptionResult",
       "ResultPath": "$.transcription_result",
@@ -33,8 +33,8 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
       "Parameters": {
-        "Bucket": "{{AUDIO_BUCKET}}",
-        "Key.$": "States.Format('transcription_output/{}.json', $.filename)"
+        "Bucket": "translatorstack-audiobucket96beecba-j7bnanhdwcyu",
+        "Key.$": "States.Format('transcription_output/{}.json', $.detail.requestParameters.key)"
       },
       "Next": "ParseTranscription",
       "ResultPath": "$.transcription_text",
@@ -50,7 +50,7 @@
       "Type": "Pass",
       "Parameters": {
         "parsed_body.$": "States.StringToJson($.transcription_text.Body)",
-        "filename.$": "$.filename"
+        "filename.$": "$.detail.requestParameters.key"
       },
       "Next": "ExtractTextAndLanguage"
     },
@@ -99,7 +99,7 @@
         "Text.$": "$.translation_result.TranslatedText",
         "OutputFormat": "mp3",
         "VoiceId": "Joanna",
-        "OutputS3BucketName": "{{AUDIO_BUCKET}}",
+        "OutputS3BucketName": "translatorstack-audiobucket96beecba-j7bnanhdwcyu",
         "OutputS3KeyPrefix.$": "States.Format('translations/{}', $.filename)"
       },
       "Next": "CheckPollyTask",
