@@ -1,176 +1,146 @@
 {
-  "StartAt": "TranscribeAudio",
+  "Comment": "State machine for detecting language, transcribing, translating, and synthesizing speech",
+  "StartAt": "DetectLanguage",
   "States": {
-    "TranscribeAudio": {
+    "DetectLanguage": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
       "Parameters": {
-        "TranscriptionJobName.$": "States.Format('TranscriptionJob-{}', $.detail.requestParameters.key)",
-        "LanguageCode": "es-US",
-        "MediaFormat": "mp3",
+        "TranscriptionJobName.$": "States.Format('DetectLanguageJob-{}', $.id)",
         "Media": {
           "MediaFileUri.$": "States.Format('s3://{}/{}', $.detail.requestParameters.bucketName, $.detail.requestParameters.key)"
         },
-        "OutputBucketName": "translatorstack-audiobucket96beecba-j7bnanhdwcyu",
-        "OutputKey.$": "States.Format('transcription_output/{}.json', $.detail.requestParameters.key)"
+        "IdentifyLanguage": true
       },
-      "Next": "WaitForTranscriptionResult",
-      "ResultPath": "$.transcription_result",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "TranscribeFailed"
-        }
-      ]
+      "ResultPath": "$.DetectLanguageOutput",
+      "Next": "WaitForLanguageDetection"
     },
-    "WaitForTranscriptionResult": {
+    "WaitForLanguageDetection": {
       "Type": "Wait",
-      "Seconds": 15,
-      "Next": "GetTranscriptionResult"
+      "Seconds": 30,
+      "Next": "GetLanguageDetectionStatus"
     },
-    "GetTranscriptionResult": {
+    "GetLanguageDetectionStatus": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:getTranscriptionJob",
       "Parameters": {
-        "Bucket": "translatorstack-audiobucket96beecba-j7bnanhdwcyu",
-        "Key.$": "States.Format('transcription_output/{}.json', $.detail.requestParameters.key)"
+        "TranscriptionJobName.$": "$.DetectLanguageOutput.TranscriptionJob.TranscriptionJobName"
       },
-      "Next": "ParseTranscription",
-      "ResultPath": "$.transcription_text",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "GetTranscriptionFailed"
-        }
-      ]
+      "ResultPath": "$.GetLanguageDetectionOutput",
+      "Next": "CheckLanguageDetectionStatus"
     },
-    "ParseTranscription": {
-      "Type": "Pass",
-      "Parameters": {
-        "parsed_body.$": "States.StringToJson($.transcription_text.Body)",
-        "filename.$": "$.detail.requestParameters.key"
-      },
-      "Next": "ExtractTextAndLanguage"
-    },
-    "ExtractTextAndLanguage": {
-      "Type": "Pass",
-      "Parameters": {
-        "transcription.$": "$.parsed_body.results.transcripts[0].transcript",
-        "language_code": "es-US",
-        "filename.$": "$.filename"
-      },
-      "Next": "IsEnglish"
-    },
-    "IsEnglish": {
+    "CheckLanguageDetectionStatus": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.language_code",
-          "StringEquals": "en-US",
-          "Next": "EndState"
+          "Variable": "$.GetLanguageDetectionOutput.TranscriptionJob.TranscriptionJobStatus",
+          "StringEquals": "COMPLETED",
+          "Next": "CheckDetectedLanguage"
+        },
+        {
+          "Variable": "$.GetLanguageDetectionOutput.TranscriptionJob.TranscriptionJobStatus",
+          "StringEquals": "FAILED",
+          "Next": "FailState"
         }
       ],
-      "Default": "TranslateText"
+      "Default": "WaitForLanguageDetection"
     },
-    "TranslateText": {
+    "CheckDetectedLanguage": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.GetLanguageDetectionOutput.TranscriptionJob.LanguageCode",
+          "StringEquals": "en-US",
+          "Next": "IgnoreWorkflow"
+        },
+        {
+          "Not": {
+            "Variable": "$.GetLanguageDetectionOutput.TranscriptionJob.LanguageCode",
+            "StringEquals": "en-US"
+          },
+          "Next": "StartTranscriptionJob"
+        }
+      ]
+    },
+    "IgnoreWorkflow": {
+      "Type": "Pass",
+      "Result": "Language is English, workflow ignored.",
+      "End": true
+    },
+    "StartTranscriptionJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
+      "Parameters": {
+        "TranscriptionJobName.$": "States.Format('TranscriptionJob-{}', $.id)",
+        "LanguageCode.$": "$.GetLanguageDetectionOutput.TranscriptionJob.LanguageCode",
+        "Media": {
+          "MediaFileUri.$": "States.Format('s3://{}/{}', $.detail.requestParameters.bucketName, $.detail.requestParameters.key)"
+        },
+        "OutputBucketName.$": "$.detail.requestParameters.bucketName"
+      },
+      "ResultPath": "$.StartTranscriptionOutput",
+      "Next": "WaitForTranscriptionJob"
+    },
+    "WaitForTranscriptionJob": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetTranscriptionJobStatus"
+    },
+    "GetTranscriptionJobStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:getTranscriptionJob",
+      "Parameters": {
+        "TranscriptionJobName.$": "$.StartTranscriptionOutput.TranscriptionJob.TranscriptionJobName"
+      },
+      "ResultPath": "$.GetTranscriptionJobOutput",
+      "Next": "CheckTranscriptionJobStatus"
+    },
+    "CheckTranscriptionJobStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.GetTranscriptionJobOutput.TranscriptionJob.TranscriptionJobStatus",
+          "StringEquals": "COMPLETED",
+          "Next": "StartTranslationJob"
+        },
+        {
+          "Variable": "$.GetTranscriptionJobOutput.TranscriptionJob.TranscriptionJobStatus",
+          "StringEquals": "FAILED",
+          "Next": "FailState"
+        }
+      ],
+      "Default": "WaitForTranscriptionJob"
+    },
+    "StartTranslationJob": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:translate:translateText",
       "Parameters": {
-        "Text.$": "$.transcription",
-        "SourceLanguageCode.$": "$.language_code",
+        "Text.$": "$.GetTranscriptionJobOutput.TranscriptionJob.Transcript.TranscriptFileUri",
+        "SourceLanguageCode.$": "$.GetTranscriptionJobOutput.TranscriptionJob.LanguageCode",
         "TargetLanguageCode": "en"
       },
-      "ResultPath": "$.translation_result",
-      "Next": "GenerateAudio",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "TranslateFailed"
-        }
-      ]
+      "ResultPath": "$.StartTranslationOutput",
+      "Next": "StartSpeechSynthesisTask"
     },
-    "GenerateAudio": {
+    "StartSpeechSynthesisTask": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:polly:startSpeechSynthesisTask",
       "Parameters": {
-        "Text.$": "$.translation_result.TranslatedText",
-        "OutputFormat": "mp3",
+        "OutputS3BucketName.$": "$.detail.requestParameters.bucketName",
+        "OutputS3KeyPrefix": "speech/",
+        "Text.$": "$.StartTranslationOutput.TranslatedText",
         "VoiceId": "Joanna",
-        "OutputS3BucketName": "translatorstack-audiobucket96beecba-j7bnanhdwcyu",
-        "OutputS3KeyPrefix.$": "States.Format('translations/{}', $.filename)"
+        "OutputFormat": "mp3"
       },
-      "Next": "CheckPollyTask",
-      "ResultPath": "$.polly_result",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "PollyFailed"
-        }
-      ]
+      "Next": "SuccessState"
     },
-    "CheckPollyTask": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:polly:getSpeechSynthesisTask",
-      "Parameters": {
-        "TaskId.$": "$.polly_result.SynthesisTask.TaskId"
-      },
-      "Next": "CheckPollyTaskStatus",
-      "ResultPath": "$.polly_task_status",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "PollyFailed"
-        }
-      ]
-    },
-    "CheckPollyTaskStatus": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.polly_task_status.SynthesisTask.TaskStatus",
-          "StringEquals": "completed",
-          "Next": "EndState"
-        },
-        {
-          "Variable": "$.polly_task_status.SynthesisTask.TaskStatus",
-          "StringEquals": "failed",
-          "Next": "PollyFailed"
-        }
-      ],
-      "Default": "WaitState"
-    },
-    "WaitState": {
-      "Type": "Wait",
-      "Seconds": 15,
-      "Next": "CheckPollyTask"
-    },
-    "EndState": {
+    "SuccessState": {
       "Type": "Succeed"
     },
-    "TranscribeFailed": {
+    "FailState": {
       "Type": "Fail",
-      "Error": "TranscriptionError",
-      "Cause": "Transcription failed"
-    },
-    "GetTranscriptionFailed": {
-      "Type": "Fail",
-      "Error": "GetTranscriptionError",
-      "Cause": "Getting transcription result failed"
-    },
-    "TranslateFailed": {
-      "Type": "Fail",
-      "Error": "TranslationError",
-      "Cause": "Translation failed"
-    },
-    "PollyFailed": {
-      "Type": "Fail",
-      "Error": "PollyError",
-      "Cause": "Polly synthesis failed"
+      "Error": "TranscriptionFailed",
+      "Cause": "The transcription job failed."
     }
   }
 }
