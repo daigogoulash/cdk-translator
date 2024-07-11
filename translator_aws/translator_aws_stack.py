@@ -6,6 +6,7 @@ from aws_cdk import (
     aws_stepfunctions as sf,
     aws_events as events,
     aws_events_targets as targets,
+    aws_cloudtrail as cloudtrail,
 )
 from constructs import Construct
 
@@ -17,6 +18,21 @@ class TranslatorStack(Stack):
         # S3 bucket for audio files
         audio_bucket = s3.Bucket(self, "AudioBucket")
 
+        # CloudTrail trail for logging S3 data events
+        trail = cloudtrail.Trail(self, "Trail",
+                                 is_multi_region_trail=False,
+                                 include_global_service_events=False,
+                                 management_events=cloudtrail.ReadWriteType.NONE)
+
+        trail.add_s3_event_selector(
+            s3_selector=[{
+                "bucket": audio_bucket,
+                "object_prefix": "",
+            }],
+            include_management_events=False,
+            read_write_type=cloudtrail.ReadWriteType.WRITE_ONLY
+        )
+
         # IAM role for Step Functions
         role = iam.Role(self, "StateMachineRole",
                         assumed_by=iam.ServicePrincipal("states.amazonaws.com"))
@@ -24,11 +40,13 @@ class TranslatorStack(Stack):
         role.add_to_policy(iam.PolicyStatement(
             resources=["*"],
             actions=[
-                "s3:*",
-                "transcribe:*",
-                "translate:*",
-                "polly:*",
-                "comprehend:*",
+                "s3:GetObject",
+                "s3:PutObject",
+                "transcribe:StartTranscriptionJob",
+                "transcribe:GetTranscriptionJob",
+                "translate:TranslateText",
+                "polly:StartSpeechSynthesisTask",
+                "polly:GetSpeechSynthesisTask"
             ]
         ))
 
@@ -52,15 +70,22 @@ class TranslatorStack(Stack):
             role=role
         )
 
-        # Event rule to trigger the state machine on S3 object creation
+        # Event rule to trigger the state machine on S3 object creation via CloudTrail
         rule = events.Rule(self, "Rule",
                            event_pattern=events.EventPattern(
                                source=["aws.s3"],
-                               detail_type=["Object Created"],
-                               resources=[audio_bucket.bucket_arn],
+                               detail_type=["AWS API Call via CloudTrail"],
                                detail={
-                                   "eventName": ["PutObject", "CompleteMultipartUpload"]
+                                   "eventSource": ["s3.amazonaws.com"],
+                                   "eventName": ["PutObject", "CompleteMultipartUpload"],
+                                   "requestParameters": {
+                                       "bucketName": [audio_bucket.bucket_name],
+                                       "x-amz-storage-class": [{"exists": True}]
+                                   }
                                }
                            ))
 
         rule.add_target(targets.SfnStateMachine(state_machine))
+
+        # Grant necessary permissions
+        audio_bucket.grant_read_write(state_machine.role)
