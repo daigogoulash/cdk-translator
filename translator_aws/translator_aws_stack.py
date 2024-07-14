@@ -1,6 +1,7 @@
 import json
 from aws_cdk import (
     Stack,
+    RemovalPolicy,
     aws_s3 as s3,
     aws_iam as iam,
     aws_stepfunctions as sf,
@@ -16,13 +17,21 @@ class TranslatorStack(Stack):
         super().__init__(scope, id, **kwargs)
 
         # S3 bucket for audio files
-        audio_bucket = s3.Bucket(self, "AudioBucket")
+        audio_bucket = s3.Bucket(self, "AudioBucket",
+                                 removal_policy=RemovalPolicy.DESTROY,
+                                 auto_delete_objects=True)
+
+        # S3 bucket for CloudTrail logs
+        trail_log_bucket = s3.Bucket(self, "TrailLogBucket",
+                                     removal_policy=RemovalPolicy.DESTROY,
+                                     auto_delete_objects=True)
 
         # CloudTrail trail for logging S3 data events
         trail = cloudtrail.Trail(self, "Trail",
                                  is_multi_region_trail=False,
                                  include_global_service_events=False,
-                                 management_events=cloudtrail.ReadWriteType.NONE)
+                                 management_events=cloudtrail.ReadWriteType.NONE,
+                                 bucket=trail_log_bucket)
 
         trail.add_s3_event_selector(
             s3_selector=[{
@@ -37,14 +46,34 @@ class TranslatorStack(Stack):
         role = iam.Role(self, "StateMachineRole",
                         assumed_by=iam.ServicePrincipal("states.amazonaws.com"))
 
+        # Add policies to the IAM role with least privilege
         role.add_to_policy(iam.PolicyStatement(
-            resources=["*"],
+            resources=[audio_bucket.bucket_arn, f"{audio_bucket.bucket_arn}/*"],
             actions=[
                 "s3:GetObject",
-                "s3:PutObject",
+                "s3:PutObject"
+            ]
+        ))
+
+        role.add_to_policy(iam.PolicyStatement(
+            resources=[f"arn:aws:transcribe:{self.region}:{self.account}:transcription-job/*"],
+            actions=[
                 "transcribe:StartTranscriptionJob",
-                "transcribe:GetTranscriptionJob",
-                "translate:TranslateText",
+                "transcribe:GetTranscriptionJob"
+            ]
+        ))
+
+        role.add_to_policy(iam.PolicyStatement(
+            resources=["*"],  # Translate does not support resource-level permissions, so using "*" is necessary
+            actions=[
+                "translate:TranslateText"
+            ]
+        ))
+
+        # Ensure Polly permissions are correctly scoped
+        role.add_to_policy(iam.PolicyStatement(
+            resources=["*"],  # Use "*" for Polly permissions since Polly actions are global
+            actions=[
                 "polly:StartSpeechSynthesisTask",
                 "polly:GetSpeechSynthesisTask"
             ]
@@ -89,3 +118,4 @@ class TranslatorStack(Stack):
 
         # Grant necessary permissions
         audio_bucket.grant_read_write(state_machine.role)
+
